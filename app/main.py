@@ -1,4 +1,6 @@
-"""FastAPI 应用入口：POST /v1/tide/fit 潮汐调和拟合。"""
+"""FastAPI 应用入口：POST /v1/tide/fit 潮汐调和拟合；
+POST /v1/tide/change-points 测站基准突变定位。
+"""
 from __future__ import annotations
 
 import numpy as np
@@ -6,8 +8,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from . import segments as seg_mod
 from . import tide
 from .schemas import (
+    ChangePointRequest,
+    ChangePointResponse,
+    ChangePointSegment,
     TideComponent,
     TideFitRequest,
     TideFitResponse,
@@ -105,4 +111,42 @@ def fit_tide(request: TideFitRequest) -> TideFitResponse:
         components=components,
         residuals=[float(r) for r in residuals],
         predictions=predictions,
+    )
+
+
+@app.post(
+    "/v1/tide/change-points",
+    response_model=ChangePointResponse,
+    tags=["tide"],
+    summary="测站基准突变定位（以拟合残差做 L1 分段）",
+)
+def locate_change_points(request: ChangePointRequest) -> ChangePointResponse:
+    residuals = np.asarray(request.residuals, dtype=np.float64)
+
+    result = seg_mod.detect_shifts(
+        residuals,
+        min_segment=request.min_segment,
+        max_changes=request.max_changes,
+        penalty=request.penalty,
+    )
+
+    segments = [
+        ChangePointSegment(
+            start=int(start),
+            end=int(end),
+            change_time=None if k == 0 else int(request.t[start]),
+            offset=float(offset),
+        )
+        for k, (start, end, offset) in enumerate(
+            zip(result.starts, result.ends, result.offsets)
+        )
+    ]
+
+    return ChangePointResponse(
+        segments=segments,
+        change_indices=[int(b) for b in result.boundaries],
+        change_times=[int(request.t[b]) for b in result.boundaries],
+        offsets=[float(o) for o in result.offsets],
+        corrected_residuals=[float(r) for r in result.corrected],
+        total_cost=float(result.total_cost),
     )
