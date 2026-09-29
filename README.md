@@ -1,7 +1,9 @@
 # 本地潮汐调和拟合 API
 
 基于 **Python + FastAPI + NumPy + SciPy** 的本地服务，对 20～500 条潮位观测做
-**Huber 稳健调和拟合**，并返回基准潮位、各周期余弦/正弦系数、逐点残差与指定时刻的预测潮位。
+**Huber 稳健调和拟合**，并返回基准潮位、各周期余弦/正弦系数、逐点残差与指定时刻的预测潮位；
+另提供 **`POST /v1/tide/datum-shift`**，以拟合残差为输入做分段中位数 L1 分割，
+定位测站基准突变（持续偏移）的起始时刻。
 
 ## 模型
 
@@ -34,7 +36,8 @@ docker compose up --build
 
 服务启动后：
 
-- 接口地址：`http://localhost:8000/v1/tide/fit`
+- 拟合接口：`http://localhost:8000/v1/tide/fit`
+- 基准突变定位：`http://localhost:8000/v1/tide/datum-shift`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/healthz`
 
@@ -131,6 +134,103 @@ print(r.json())
 - `residuals`：逐点残差 `h - ĥ`，与 `t` 等长（含异常点本身的残差，不会被剔除）
 - `predictions`：`predict_times` 对应预测潮位；未提供时为空数组
 
+## 测站基准突变定位：`POST /v1/tide/datum-shift`
+
+`/v1/tide/fit` 返回的逐点残差中，若存在**持续的整体偏移**（例如水尺零点
+重设、换站导致的基准突变），可把同一组 `t` 与 `residuals` 送到本接口，
+自动定位偏移从何时开始。
+
+### 分段模型
+
+把残差序列切成若干段，每段以段内残差的**较小中位数**（升序后下标
+`(L-1)//2` 的元素）作为该段偏移 `o`，最小化
+
+```
+目标 = Σ_i | residuals[i] - o_seg(i) | + penalty × 变点数
+```
+
+并满足：每段长度（点数）≥ `min_segment`，变点数 ≤ `max_changes`。
+
+**并列裁决**：总目标相同的可行方案中，先取**变点数最少**者；再取**变点
+索引序列字典序最小**者（同等条件下偏移尽量晚切、切点尽量靠前）。
+
+### 请求
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `t` | integer[] | 与 `/v1/tide/fit` 相同的观测时刻（整数分钟），严格递增，**20～500** 条 |
+| `residuals` | number[] | `/v1/tide/fit` 返回的逐点残差，与 `t` 等长，全部**有限** |
+| `min_segment` | integer | 最短段长（点数），**5～100** 且不超过点数 |
+| `max_changes` | integer | 最大变点数，**0～4** |
+| `penalty` | number | 每个变点的惩罚，**非负有限**；越大越倾向少切（`0` 时并列必取最少变点） |
+
+### 响应
+
+```json
+{
+  "segments": [
+    {"start": 0,  "end": 35, "offset": -0.1451},
+    {"start": 35, "end": 60, "offset": 0.8382}
+  ],
+  "change_points": [
+    {"index": 35, "time": 1050}
+  ],
+  "offsets": [-0.1451, 0.8382],
+  "corrected_residuals": ["...len(t) 个，residuals[i] - 所属段偏移"],
+  "objective": 5.2472
+}
+```
+
+- `segments`：各段的 **`[start, end)` 索引区间**（左闭右开）与该段偏移
+- `change_points`：每个变点给出**所在新段首点**的下标 `index` 与整数分钟
+  时刻 `time = t[index]`——即“持续偏移从这个时刻的点开始”；无变点时为 `[]`
+- `offsets`：各段偏移（与 `segments` 同序）
+- `corrected_residuals`：扣除所属段偏移后的逐点残差，与 `t` 等长
+- `objective`：总目标值（绝对偏差之和 + `penalty × 变点数`）
+
+### 串接两次调用的可执行示例
+
+[`examples/chained_datum_shift.py`](examples/chained_datum_shift.py) 先调
+`/v1/tide/fit` 取残差，再调 `/v1/tide/datum-shift` 定位注入的基准突变
+（仅用标准库 `urllib`）：
+
+```bash
+# 1. 启动服务（端口 8000）
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# 2. 另开终端运行
+python examples/chained_datum_shift.py
+# 可选参数：--base-url http://localhost:8000 --min-segment 10 \
+#           --max-changes 2 --penalty 1.5
+```
+
+预期输出：
+
+```
+== /v1/tide/fit ==
+baseline = 2.6815
+
+== /v1/tide/datum-shift ==
+检测到基准突变：新段首点 index=35，时刻 t=1050 分钟
+  段 [  0,  35)  t=[0, 1020]（末点含）  偏移 = -0.1451
+  段 [ 35,  60)  t=[1050, 1770]（末点含）  偏移 = +0.8382
+总目标值 = 5.2472
+校正后残差 RMS = 0.0729
+```
+
+等价的内联 shell 串接（`jq` 提取第一次调用的残差）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/tide/fit \
+  -H 'Content-Type: application/json' \
+  -d '{"t": [0,30,60,"..."], "h": [4.16,"..."], "P": [745], "delta": 0.2}' \
+| jq '{t: [range(0;(.residuals|length)*30;30)],
+       residuals: .residuals,
+       min_segment: 10, max_changes: 2, penalty: 1.5}' \
+| curl -s -X POST http://localhost:8000/v1/tide/datum-shift \
+  -H 'Content-Type: application/json' -d @-
+```
+
 ## 错误处理（HTTP 422）
 
 以下情况返回 `422 Unprocessable Entity`，错误体 `detail` 中给出字段位置与原因：
@@ -142,6 +242,9 @@ print(r.json())
 - `predict_times` 含非整数
 - **设计矩阵不满列秩**（例如某两个周期在当前整数分钟采样下混叠、
   或某周期在采样格点上恒为常数）——请调整周期或观测时刻
+- `/v1/tide/datum-shift`：`residuals` 与 `t` 长度不一致或含 NaN/Infinity、
+  `min_segment` 不在 5～100 或超过点数、`max_changes` 不在 0～4、
+  `penalty` 为负或非有限（上述整数字段传浮点数/布尔值同样 422）
 
 ## 测试
 
@@ -151,16 +254,20 @@ pytest -q
 ```
 
 测试覆盖：干净信号参数恢复、含异常点时 Huber 相对最小二乘的稳健性、
-时间原点平移不变性、秩亏 422 以及各类非法输入 422。
+时间原点平移不变性、秩亏 422 以及各类非法输入 422；基准突变定位覆盖
+阶跃恢复、段长约束、`max_changes=0`、penalty 抑制碎切、并列时
+“变点少优先 + 字典序最小”、与暴力枚举对拍、422 校验，以及与
+`/v1/tide/fit` 串接的端到端流程。
 
 ## 项目结构
 
 ```
 app/
   main.py      # FastAPI 路由、422 校验、秩检查
-  schemas.py   # Pydantic 请求/响应模型
+  schemas.py   # Pydantic 请求/响应模型（fit 与 datum-shift）
   tide.py      # 设计矩阵、Huber 损失、IRLS + L-BFGS-B 求解
-examples/      # 请求示例
+  segments.py  # 双堆较小中位数代价表 + 带段长约束的 L1 分段动态规划
+examples/      # 请求示例；chained_datum_shift.py 串接两次调用
 tests/         # pytest 端到端测试
 Dockerfile
 docker-compose.yml

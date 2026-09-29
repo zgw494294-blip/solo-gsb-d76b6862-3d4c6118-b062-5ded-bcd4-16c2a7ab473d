@@ -8,11 +8,14 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from . import tide
 from .schemas import (
+    DatumShiftRequest,
+    DatumShiftResponse,
     TideComponent,
     TideFitRequest,
     TideFitResponse,
     TidePrediction,
 )
+from .segments import locate_shifts
 
 app = FastAPI(
     title="本地潮汐调和拟合 API",
@@ -106,3 +109,26 @@ def fit_tide(request: TideFitRequest) -> TideFitResponse:
         residuals=[float(r) for r in residuals],
         predictions=predictions,
     )
+
+
+@app.post(
+    "/v1/tide/datum-shift",
+    response_model=DatumShiftResponse,
+    tags=["tide"],
+    summary="测站基准突变定位（残差分段中位数 L1 分割）",
+)
+def locate_datum_shift(request: DatumShiftRequest) -> DatumShiftResponse:
+    """以 /v1/tide/fit 的逐点 residuals 与同一组 t 定位持续偏移的起点。
+
+    每段偏移取段内残差的较小中位数，最小化「各点到所属偏移的绝对差
+    之和 + penalty × 变点数」，并满足最短段长约束；并列时变点少者优先，
+    再取变点索引序列字典序最小者。
+    """
+    result = locate_shifts(
+        residuals=request.residuals,
+        times=request.t,
+        min_segment=request.min_segment,
+        max_changes=request.max_changes,
+        penalty=request.penalty,
+    )
+    return DatumShiftResponse(**result)

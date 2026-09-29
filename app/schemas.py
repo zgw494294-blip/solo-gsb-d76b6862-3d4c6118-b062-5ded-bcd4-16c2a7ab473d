@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
 
 class TideFitRequest(BaseModel):
@@ -104,4 +104,109 @@ class TideFitResponse(BaseModel):
     residuals: list[float] = Field(..., description="逐点残差（观测 - 拟合），与 t 等长")
     predictions: list[TidePrediction] = Field(
         ..., description="predict_times 对应的预测潮位"
+    )
+
+
+class DatumShiftRequest(BaseModel):
+    """POST /v1/tide/datum-shift 请求体。
+
+    输入为 /v1/tide/fit 返回的逐点残差 residuals 与同一组严格递增的
+    整数分钟时刻 t；在分段常数 L1 模型下定位测站基准突变（持续偏移）。
+    """
+
+    t: list[int] = Field(..., description="观测时刻（整数分钟），严格递增，20~500 条")
+    residuals: list[float] = Field(
+        ..., description="逐点残差（直接来自 /v1/tide/fit 的 residuals），与 t 等长且全部有限"
+    )
+    min_segment: StrictInt = Field(
+        ..., description="最短段长（点数），5~100 且不超过点数"
+    )
+    max_changes: StrictInt = Field(..., description="允许的最大变点数，0~4")
+    penalty: float = Field(..., description="每个变点的非负有限惩罚")
+
+    model_config = {"populate_by_name": True, "extra": "ignore"}
+
+    @staticmethod
+    def _is_strict_int(x: Any) -> bool:
+        return isinstance(x, int) and not isinstance(x, bool)
+
+    @field_validator("t")
+    @classmethod
+    def _validate_t(cls, v: list[int]) -> list[int]:
+        if not 20 <= len(v) <= 500:
+            raise ValueError("t 的长度必须在 20~500 之间")
+        if any(not cls._is_strict_int(x) for x in v):
+            raise ValueError("t 必须全部为整数")
+        if any(b <= a for a, b in zip(v, v[1:])):
+            raise ValueError("t 必须严格递增")
+        return v
+
+    @field_validator("residuals")
+    @classmethod
+    def _validate_residuals(cls, v: list[float]) -> list[float]:
+        if any(not math.isfinite(float(x)) for x in v):
+            raise ValueError("residuals 必须全部为有限数（不允许 NaN / Inf）")
+        return [float(x) for x in v]
+
+    @field_validator("min_segment")
+    @classmethod
+    def _validate_min_segment(cls, v: int) -> int:
+        # StrictInt 已保证为真正的整数（拒绝 bool / 5.0 等）
+        if not 5 <= v <= 100:
+            raise ValueError("min_segment 必须在 5~100 之间")
+        return v
+
+    @field_validator("max_changes")
+    @classmethod
+    def _validate_max_changes(cls, v: int) -> int:
+        if not 0 <= v <= 4:
+            raise ValueError("max_changes 必须在 0~4 之间")
+        return v
+
+    @field_validator("penalty")
+    @classmethod
+    def _validate_penalty(cls, v: float) -> float:
+        if not math.isfinite(float(v)) or v < 0.0:
+            raise ValueError("penalty 必须为非负有限数")
+        return float(v)
+
+    @model_validator(mode="after")
+    def _validate_lengths(self) -> "DatumShiftRequest":
+        if len(self.t) != len(self.residuals):
+            raise ValueError("t 与 residuals 长度必须相同")
+        if self.min_segment > len(self.t):
+            raise ValueError("min_segment 不能超过点数")
+        return self
+
+
+class DatumSegment(BaseModel):
+    """单个常值偏移段。"""
+
+    start: int = Field(..., description="段首点下标（含）")
+    end: int = Field(..., description="段尾点下标（不含），区间为 [start, end)")
+    offset: float = Field(..., description="该段偏移（段内残差的较小中位数）")
+
+
+class DatumChangePoint(BaseModel):
+    """单个变点：新段的首点。"""
+
+    index: int = Field(..., description="变点所在新段首点的下标")
+    time: int = Field(..., description="变点所在新段首点的整数分钟时刻 t[index]")
+
+
+class DatumShiftResponse(BaseModel):
+    """基准突变定位结果。"""
+
+    segments: list[DatumSegment] = Field(
+        ..., description="各段 [start, end) 索引区间与偏移"
+    )
+    change_points: list[DatumChangePoint] = Field(
+        ..., description="各变点（新段首点）的下标与时刻；无变点时为空数组"
+    )
+    offsets: list[float] = Field(..., description="各段偏移（与 segments 同序）")
+    corrected_residuals: list[float] = Field(
+        ..., description="校正后逐点残差 residuals[i] - 所属段偏移，与 t 等长"
+    )
+    objective: float = Field(
+        ..., description="总目标值：绝对偏差之和 + penalty × 变点数"
     )
